@@ -1,27 +1,64 @@
-/* boards/nrf5340dk_nrf5340_cpuapp.overlay */
+/*
+ * File: boards/nrf5340dk_nrf5340_cpuapp.overlay
+ *
+ * Purpose:
+ *   DeviceTree overlay for the nRF5340DK application core used by VitalLink.
+ *   - Enables I²C1 (TWIM1) and maps SDA/SCL to P0.27/P0.26 (placeholder values)
+ *   - Sets a low-power pinctrl state for sleep.
+ *   - alias "i2c_ppg" so firmware can fetch the I2C dev
+ *     via DT_ALIAS(i2c_ppg) without hardcoding the controller name.
+ *
+ * Notes:
+ *   - I²C now set to STANDARD (100 kHz) to match PCB design and pull-ups.
+ *   - buzzer logic to be added later
+ */
 
+/* -------- Pin controller configuration for I2C1 -------- */
 &pinctrl {
-    i2c1_default: i2c1_default { group1 {
-        psels = <NRF_PSEL(TWIM_SDA, 0, 27)>,
-                <NRF_PSEL(TWIM_SCL, 0, 26)>;
-    };};
-    i2c1_sleep: i2c1_sleep { group1 {
-        psels = <NRF_PSEL(TWIM_SDA, 0, 27)>,
-                <NRF_PSEL(TWIM_SCL, 0, 26)>;
-        low-power-enable;
-    };};
+	/* Default (active) I2C1 pins */
+	i2c1_default: i2c1_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 27)>,   /* SDA on P0.27 */
+			        <NRF_PSEL(TWIM_SCL, 0, 26)>;   /* SCL on P0.26 */
+		};
+	};
+
+	/* Low-power (sleep) I2C1 pins */
+	i2c1_sleep: i2c1_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 27)>,
+			        <NRF_PSEL(TWIM_SCL, 0, 26)>;
+			low-power-enable;
+		};
+	};
 };
 
-/* Enable I2C1 (TWIM1) */
+/* -------- Enable I2C1 (TWIM1) at 100 kHz -------- */
 &i2c1 {
-    status = "okay";
-    clock-frequency = <I2C_BITRATE_FAST>;
-    pinctrl-0 = <&i2c1_default>;
-    pinctrl-1 = <&i2c1_sleep>;
-    pinctrl-names = "default", "sleep";
+	status = "okay";
+	/* PCB chosen speed: 100 kHz (STANDARD) */
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-1 = <&i2c1_sleep>;
+	pinctrl-names = "default", "sleep";
 };
 
-/* Add a friendly alias so code can use DT_ALIAS(i2c_ppg) */
+/* -------- Aliases to simplify firmware lookups -------- */
 &{/aliases} {
-    i2c-ppg = &i2c1;
+	i2c-ppg = &i2c1;     /* Firmware uses DT_ALIAS(i2c_ppg) */
+	/* buzzer = &buzzer0;   // use when buzzer0 defined */
 };
+
+/* -------- Optional: define a simple buzzer GPIO node --------
+ * Un-comment and set a real GPIO if you add an active buzzer.
+ * The firmware uses: GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios)
+ * Example below assumes an active-high buzzer on P0.15.
+ */
+/*
+/ {
+	buzzer0: buzzer0 {
+		gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+};
+*/

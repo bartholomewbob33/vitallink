@@ -16,6 +16,3 @@
 /* Vitals Notify Characteristic UUID (random example) */
 #define VITALS_CHAR_UUID_INIT \
   BT_UUID_INIT_128(0x99,0x11,0x3f,0x5e,0x2a,0x7d,0x5a,0x8d,0x2a,0x4b,0xb2,0x39,0xb7,0xc4,0xe2,0xd3)
-
-/* TODO: If you later add a Control characteristic (writes from Pi -> band),
- * define another 128-bit UUID here and implement a write handler in main.c. */
