@@ -29,13 +29,15 @@
  * Notes:
  *   - NORMAL = both ALERT and EMERGENCY bits clear (0).
  *   - Bump VITALINK_PROTO_VER if you change this layout.
+ *   - This version adds a small finalize() helper and a Zephyr-friendly
+ *     build assert with helpful error text.
  * --------------------------------------------------------------------------- */
 
 #pragma once
 #include <stdint.h>
 
+/*  fallback for host tools. */
 #ifndef __packed
-/* Zephyr toolchain defines __packed already; this fallback is for host tools. */
 #define __packed __attribute__((__packed__))
 #endif
 
@@ -56,8 +58,13 @@ struct __packed vitals_pkt {
   uint8_t  rfu;            /* [15] reserved (0)                                   */
 };
 
-/* ---- Compile-time guard: struct MUST remain 16 bytes --------------------- */
-typedef char _vitals_pkt_must_be_16_bytes[ (sizeof(struct vitals_pkt) == 16) ? 1 : -1 ];
+/* ---- guard to ensure struct  remain 16 bytes --------------------- */
+#if defined(CONFIG_ZEPHYR)
+  #include <zephyr/sys/util_macro.h>
+  BUILD_ASSERT(sizeof(struct vitals_pkt) == 16, "vitals_pkt must be 16 bytes");
+#else
+  typedef char _vitals_pkt_must_be_16_bytes[ (sizeof(struct vitals_pkt) == 16) ? 1 : -1 ];
+#endif
 
 /* ---- Flag bit definitions ------------------------------------------------ */
 #define VFLAG_MOTION_ARTIFACT  (1u << 0)
@@ -92,7 +99,7 @@ static inline int vitals_checksum_ok(const struct vitals_pkt *p)
   return p->checksum == vitals_checksum_compute(p);
 }
 
-/* Flag convenience: set/clear alert/emergency safely (mutually exclusive if desired). */
+/* Flag convenience: set/clear alert/emergency safely (mutually exclusive) */
 static inline void vitals_flags_set_alert(struct vitals_pkt *p)
 {
   p->flags |= VFLAG_ALERT;
@@ -106,4 +113,16 @@ static inline void vitals_flags_set_emergency(struct vitals_pkt *p)
 static inline void vitals_flags_clear_tiers(struct vitals_pkt *p)
 {
   p->flags &= (uint8_t)~(VFLAG_ALERT | VFLAG_EMERGENCY);
+}
+
+/* ---- finalize helper ----------------------------------------------- */
+/* Ensures callers always set the correct protocol version, zero RFU, and
+ * refresh the checksum after all fields are written.
+ * going to be called once right before notifying over BLE.
+ */
+static inline void vitals_finalize(struct vitals_pkt *p)
+{
+  p->ver = VITALINK_PROTO_VER;
+  p->rfu = 0u;
+  vitals_checksum_fill(p);
 }

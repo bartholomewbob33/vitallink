@@ -1,4 +1,4 @@
-/*
+/* -----------------------------------------------------------------------------
  * File: boards/nrf5340dk_nrf5340_cpuapp.overlay
  *
  * Purpose:
@@ -11,7 +11,7 @@
  * Notes:
  *   - I²C now set to STANDARD (100 kHz) to match PCB design and pull-ups.
  *   - buzzer logic to be added later
- */
+ * --------------------------------------------------------------------------- */
 
 /* -------- Pin controller configuration for I2C1 -------- */
 &pinctrl {
@@ -46,19 +46,28 @@
 /* -------- Aliases to simplify firmware lookups -------- */
 &{/aliases} {
 	i2c-ppg = &i2c1;     /* Firmware uses DT_ALIAS(i2c_ppg) */
-	/* buzzer = &buzzer0;   // use when buzzer0 defined */
+	/* buzzer = &buzzer;   // use when buzzer is defined below */
 };
 
-/* -------- Optional: define a simple buzzer GPIO node --------
- * Un-comment and set a real GPIO if you add an active buzzer.
+/* -------- simple buzzer GPIO node --------
+ * set real GPIO if using an active buzzer.
  * The firmware uses: GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios)
- * Example below assumes an active-high buzzer on P0.15.
+ * Example below assumes an active-high buzzer on P0.15 and gives it a
+ * generic "gpio-leds" compatible 
  */
 /*
 / {
 	buzzer0: buzzer0 {
-		gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+		compatible = "gpio-leds";
+		buzzer: buzzer {
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+			label = "BUZZER";
+		};
 		status = "okay";
 	};
+};
+
+&{/aliases} {
+	buzzer = &buzzer;
 };
 */
