@@ -1,73 +1,130 @@
-/* -----------------------------------------------------------------------------
- * File: boards/nrf5340dk_nrf5340_cpuapp.overlay
+/* boards/nrf5340dk_nrf5340_cpuapp.overlay
  *
- * Purpose:
- *   DeviceTree overlay for the nRF5340DK application core used by VitalLink.
- *   - Enables I²C1 (TWIM1) and maps SDA/SCL to P0.27/P0.26 (placeholder values)
- *   - Sets a low-power pinctrl state for sleep.
- *   - alias "i2c_ppg" so firmware can fetch the I2C dev
- *     via DT_ALIAS(i2c_ppg) without hardcoding the controller name.
- *
- * Notes:
- *   - I²C now set to STANDARD (100 kHz) to match PCB design and pull-ups.
- *   - buzzer logic to be added later
- * --------------------------------------------------------------------------- */
+ * VitalLink wristband overlay (nRF5340 DK app core)
+ * - I2C1 on P0.19 (SCL) / P0.21 (SDA)
+ * - Buzzer on P1.04 (active-high)
+ * - Temp INT=P1.05 (active-low), HR INT=P1.06 (active-low), IMU INT=P1.10 (active-high)
+ * - CHG_EN on P1.08 (active-low to enable)
+ * - I2C devices: MAX30102 @0x57, MAX30208 @0x4A, LSM6DSOX @0x6A, BQ25155 @0x6B
+ */
 
-/* -------- Pin controller configuration for I2C1 -------- */
+/* --- I2C1 pinctrl --- */
 &pinctrl {
-	/* Default (active) I2C1 pins */
 	i2c1_default: i2c1_default {
 		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 27)>,   /* SDA on P0.27 */
-			        <NRF_PSEL(TWIM_SCL, 0, 26)>;   /* SCL on P0.26 */
+			psels = <NRF_PSEL(TWIM_SCL, 0, 19)>,
+			        <NRF_PSEL(TWIM_SDA, 0, 21)>;
 		};
 	};
 
-	/* Low-power (sleep) I2C1 pins */
 	i2c1_sleep: i2c1_sleep {
 		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 27)>,
-			        <NRF_PSEL(TWIM_SCL, 0, 26)>;
+			psels = <NRF_PSEL(TWIM_SCL, 0, 19)>,
+			        <NRF_PSEL(TWIM_SDA, 0, 21)>;
 			low-power-enable;
 		};
 	};
 };
 
-/* -------- Enable I2C1 (TWIM1) at 100 kHz -------- */
+/* --- I2C1 controller + devices --- */
 &i2c1 {
 	status = "okay";
-	/* PCB chosen speed: 100 kHz (STANDARD) */
-	clock-frequency = <I2C_BITRATE_STANDARD>;
+	clock-frequency = <I2C_BITRATE_STANDARD>; /* 100 kHz */
 	pinctrl-0 = <&i2c1_default>;
 	pinctrl-1 = <&i2c1_sleep>;
 	pinctrl-names = "default", "sleep";
-};
 
-/* -------- Aliases to simplify firmware lookups -------- */
-&{/aliases} {
-	i2c-ppg = &i2c1;     /* Firmware uses DT_ALIAS(i2c_ppg) */
-	/* buzzer = &buzzer;   // use when buzzer is defined below */
-};
-
-/* -------- simple buzzer GPIO node --------
- * set real GPIO if using an active buzzer.
- * The firmware uses: GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios)
- * Example below assumes an active-high buzzer on P0.15 and gives it a
- * generic "gpio-leds" compatible 
- */
-/*
-/ {
-	buzzer0: buzzer0 {
-		compatible = "gpio-leds";
-		buzzer: buzzer {
-			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
-			label = "BUZZER";
-		};
+	/* MAX30102 Heart Rate / SpO2 sensor */
+	max30102@57 {
+		compatible = "i2c-device";
+		// compatible = "maxim,max30102";
+		reg = <0x57>;
 		status = "okay";
+		label = "MAX30102";
+	};
+
+	/* MAX30208 Skin Temperature sensor*/
+	max30208@50 {
+		compatible = "i2c-device";
+		// compatible = "maxim,max30208";
+		reg = <0x50>;
+		status = "okay";
+		label = "MAX30208";
+	};
+
+	/* LSM6DSOX 6-axis IMU */
+	lsm6dsox@6a {
+		compatible = "i2c-device";
+		// compatible = "st,lsm6dsox";
+		reg = <0x6a>; /* 0x6b if SA0 high */
+		status = "okay";
+		label = "LSM6DSOX";
+	};
+
+	/* TI BQ25155 PMIC / Charger (node present even if no driver in use) */
+	bq25155@6b {
+		compatible = "i2c-device";
+		// compatible = "ti,bq25155";
+		reg = <0x6b>;
+		status = "okay";
+		label = "BQ25155";
 	};
 };
 
-&{/aliases} {
-	buzzer = &buzzer;
+/* --- GPIO-backed peripherals & aliases --- */
+ / {
+	/* Buzzer (P1.04, active-high) */
+	buzzer_grp: buzzer_grp {
+		compatible = "gpio-leds";
+		buzzer: buzzer {
+			gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+			label = "BUZZER";
+		};
+	};
+
+	/* Charge enable to BQ25155 CE_N (P1.08, active-low = enable) */
+	chg_grp: chg_grp {
+		compatible = "gpio-leds";
+		chg_en: chg_en {
+			gpios = <&gpio1 8 GPIO_ACTIVE_LOW>;
+			label = "CHG_EN";
+		};
+	};
+
+	/* Sensor interrupt inputs */
+	ints: ints {
+		compatible = "gpio-keys";
+
+		/* MAX30208 TEMP_INT: active LOW */
+		temp_int: temp_int {
+			gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;  /* P1.05 */
+			label = "TEMP_INT";
+		};
+
+		/* MAX30102 HR_INT: active LOW */
+		hr_int: hr_int {
+			gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;  /* P1.06 */
+			label = "HR_INT";
+		};
+
+		/* LSM6DSOX IMU_INT: active HIGH */
+		imu_int: imu_int {
+			gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>; /* P1.10 */
+			label = "IMU_INT";
+		};
+	};
+
+	/* === Aliases that match DT_ALIAS(...) calls in code (use underscores) === */
+	aliases {
+		i2c-ppg = &i2c1;
+		buzzer = &buzzer;
+		chg-en  = &chg_en;
+		temp-int = &temp_int;
+		hr-int   = &hr_int;
+		imu-int  = &imu_int;
+	};
 };
-*/
+
+&cryptocell {
+	status = "disabled";
+};

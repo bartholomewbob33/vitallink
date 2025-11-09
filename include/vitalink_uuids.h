@@ -3,9 +3,8 @@
  * Purpose: Holds the custom 128-bit BLE UUIDs used by the project.
  *
  * Notes:
- * - Keep these UUIDs in sync with your Raspberry Pi subscriber.
  * - Service UUID identifies the "container"; Characteristic UUID is the data pipe.
- * - This version exports ready-to-use const objects, simple accessors, and a
+ * - exports const objects, simple accessors, and a
  *   convenience macro to include the Service UUID in advertising data.
  * --------------------------------------------------------------------------- */
 

@@ -2,25 +2,17 @@
  * File: src/main.c
  * Purpose: VitalLink wristband firmware (nRF5340 DK, NCS v2.9.2)
  *
- * What this file does:
- *  - Initializes Bluetooth in Peripheral role.
- *  - Sets a DYNAMIC device name at runtime using the BLE address tail.
- *  - Defines a custom GATT service + NOTIFY characteristic.
- *  - Builds a 16-byte vitals packet once per second and decides a tier:
- *        NORMAL   => suppress except 60 s heartbeats
- *        ALERT    => send immediately
- *        EMERGENCY=> send immediately + buzzer pulse (if present)
- *  - Uses an 8-bit CHECKSUM (sum of bytes 0..13).
- *  -  additional flags:
- *        Motion artifact (debounced)
- *        Low battery (via ADC if VBAT alias present)
- *        Sensor fault (debounced failure counters)
- *  - Implements "Charging ⇒ System OFF":
- *        If the charger STAT (active-low) is asserted at boot, enter System OFF.
- *        If STAT asserts during runtime, quickly enter System OFF as well.
- *
- * Build target:
- *  - Board: nrf5340dk/nrf5340/cpuapp
+ * Key features:
+ *  - BLE Peripheral with dynamic device name "VitalLink-XXXX"
+ *  - Custom GATT service + NOTIFY characteristic (UUIDs in vitalink_uuids.h)
+ *  - 1 Hz vitals sampling via sensors_vitalink (raw I2C for MAX30102/LSM6DSOX/MAX30208),
+ *    tiering, checksum
+ *  - BATTERY + CHARGING via BQ25155 over I2C:
+ *      * Low-battery flag injected into packet flags
+ *      * "Docked idle" while charging: stop BLE/sampling, poll PMIC every 3 s,
+ *        resume automatically when unplugged
+ *  - Optional buzzer (P1.04 active-high) on EMERGENCY tier
+ *  - I2C1 on P0.19 (SCL) / P0.21 (SDA) for sensors + PMIC
  * --------------------------------------------------------------------------- */
 
 #include <zephyr/kernel.h>
@@ -28,22 +20,25 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/adc.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
 #include <stdbool.h>
+#include <string.h>
 
+#include "sensors_vitalink.h"
 #include "vitalink_uuids.h"
 #include "vitalink_proto.h"
+#include "pmic_bq25155.h"
 
 LOG_MODULE_REGISTER(vitalink, LOG_LEVEL_INF);
 
-/* ===== I2C handle (for sensors later) ==================================== */
+/* ===== I2C handle (sensors + PMIC) ======================================= */
+/* Overlay alias is 'i2c-ppg'; Zephyr macro uses underscore form 'i2c_ppg' */
 #define I2C_NODE DT_ALIAS(i2c_ppg)
-static const struct device *i2c_dev;
+static const struct device *i2c0_dev;
 
-/* ===== Optional buzzer (active buzzer via GPIO) =========================== */
+/* ===== Optional buzzer (active-high) ===================================== */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(buzzer), okay)
 #define HAS_BUZZER 1
 static const struct gpio_dt_spec buzzer = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios);
@@ -51,102 +46,27 @@ static const struct gpio_dt_spec buzzer = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpi
 #define HAS_BUZZER 0
 #endif
 
-/* ===== Charging detect (PMIC STAT, active-low) ============================ */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(chg_stat), okay)
-#define HAS_CHG_STAT 1
-static const struct gpio_dt_spec chg_stat = GPIO_DT_SPEC_GET(DT_ALIAS(chg_stat), gpios);
-#else
-#define HAS_CHG_STAT 0
-#endif
+/* ===== Aliased GPIOs for INTs and charge enable ========================== */
+static const struct gpio_dt_spec pin_temp_int = GPIO_DT_SPEC_GET(DT_ALIAS(temp_int), gpios);
+static const struct gpio_dt_spec pin_hr_int   = GPIO_DT_SPEC_GET(DT_ALIAS(hr_int),   gpios);
+static const struct gpio_dt_spec pin_imu_int  = GPIO_DT_SPEC_GET(DT_ALIAS(imu_int),  gpios);
+static const struct gpio_dt_spec pin_chg_en   = GPIO_DT_SPEC_GET(DT_ALIAS(chg_en),   gpios);
 
-/* =====  VBAT ADC alias (external divider) =========================
- * If this alias is present, we can compute true VBAT and set the low-battery flag.
- * If absent, low-battery logic is a clean no-op until wired.
- */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(vbat), okay)
-#define HAS_VBAT_ADC 1
-/* The alias points to a node with io-channels = <&adc N>; we fetch that channel. */
-static const struct adc_dt_spec vbat_adc = ADC_DT_SPEC_GET(DT_ALIAS(vbat));
-#else
-#define HAS_VBAT_ADC 0
-#endif
+/* ===== BLE UUIDs ========================================================= */
+static struct bt_uuid_128 svc_uuid = VITALINK_SERVICE_UUID_INIT;
+static struct bt_uuid_128 chr_uuid = VITALS_CHAR_UUID_INIT;
 
-/* ===== BLE GATT: Service + Characteristic (static UUID objects) ========== */
-static const struct bt_uuid_128 SVC_UUID = VITALINK_SERVICE_UUID_INIT;
-static const struct bt_uuid_128 CHR_UUID = VITALS_CHAR_UUID_INIT;
+/* CCC subscription flag */
 static uint8_t notify_enabled;
 
-/* CCC change callback */
-static void ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
-{
-    notify_enabled = (value == BT_GATT_CCC_NOTIFY);
-    LOG_INF("Notify %s", notify_enabled ? "ENABLED" : "DISABLED");
-}
+/* OPTIONAL: track connection so notify targets the active central */
+static struct bt_conn *current_conn;
 
-/* Attribute indices:
- *   [0] Primary Service, [1] Char Declaration, [2] Char VALUE, [3] CCC
- */
-BT_GATT_SERVICE_DEFINE(vitalink_svc,
-    BT_GATT_PRIMARY_SERVICE(&SVC_UUID.uuid),
-    BT_GATT_CHARACTERISTIC(&CHR_UUID.uuid,
-                           BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_NONE,
-                           NULL, NULL, NULL),
-    BT_GATT_CCC(ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
-);
-#define VITALINK_CHAR_VALUE_ATTR (&vitalink_svc.attrs[2])
+/* ===== Battery thresholds (mV) =========================================== */
+#define LOW_BATT_ALERT_MV    3500
+#define LOW_BATT_RECOVER_MV  3600
 
-/* ===== Dynamic BLE name from identity address ============================ */
-#define VITALINK_DYN_NAME_MAX 32
-static void set_dynamic_name_from_addr(void)
-{
-    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
-    size_t count = CONFIG_BT_ID_MAX;
-
-    /* NCS 2.9.x: bt_id_get is void; it fills addrs[] and updates count. */
-    bt_id_get(addrs, &count);
-    if (count == 0) {
-        LOG_WRN("No BLE identities; keeping default name");
-        return;
-    }
-
-    const uint8_t *v = addrs[0].a.val;  /* 6 bytes */
-    char dyn_name[VITALINK_DYN_NAME_MAX];
-    snprintk(dyn_name, sizeof(dyn_name), "VitalLink-%02X%02X", v[1], v[0]);
-
-    int err = bt_set_name(dyn_name);
-    if (err) LOG_WRN("bt_set_name failed (%d)", err);
-    else     LOG_INF("BLE name set to: %s", dyn_name);
-}
-
-/* ===== Advertising start (includes Service UUID) ========================= */
-static void bt_ready_cb(int err)
-{
-    if (err) {
-        LOG_ERR("Bluetooth init failed (%d)", err);
-        return;
-    }
-
-    static const struct bt_data ad[] = {
-        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-        VITALINK_AD_SERVICE_UUID,
-    };
-
-    err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err) LOG_ERR("Advertising start failed (%d)", err);
-    else     LOG_INF("Advertising started");
-}
-
-/* ===== Notify helper ===================================================== */
-static void send_vitals(const struct vitals_pkt *pkt)
-{
-    if (!notify_enabled) return;
-    const struct bt_gatt_attr *attr = VITALINK_CHAR_VALUE_ATTR; /* value at index 2 */
-    int err = bt_gatt_notify(NULL, attr, pkt, sizeof(*pkt));
-    if (err) LOG_WRN("notify err %d", err);
-}
-
-/* ===== Tiering thresholds and policy ==================================== */
+/* ===== Tier thresholds (defaults; refine clinically later) =============== */
 #define HR_ALERT_BPM        120
 #define HR_EMERG_BPM        140
 #define SPO2_ALERT_PCT       92
@@ -154,306 +74,354 @@ static void send_vitals(const struct vitals_pkt *pkt)
 #define TEMP_ALERT_C_X100  3800   /* 38.00 C */
 #define TEMP_EMERG_C_X100  3950   /* 39.50 C */
 
-static uint8_t decide_flags_tier(uint8_t hr_bpm, uint8_t spo2, int16_t skin_c_x100)
-{
-    if (hr_bpm >= HR_EMERG_BPM || spo2 <= SPO2_EMERG_PCT || skin_c_x100 >= TEMP_EMERG_C_X100)
-        return VFLAG_EMERGENCY;
-    if (hr_bpm >= HR_ALERT_BPM  || spo2 <= SPO2_ALERT_PCT  || skin_c_x100 >= TEMP_ALERT_C_X100)
-        return VFLAG_ALERT;
-    return 0;
-}
-
-/* ===== Motion artifact flag (debounced on activity RMS) ================== */
-/* Heuristic based on act_rms_x100 (units: 0.01 g). E.g., 400 => 4.00 m/s^2 ~ 0.4 g */
-#define MA_HIGH_THRESH_X100   400  /* >=0.4 g RMS => motion likely corrupting PPG */
-#define MA_SET_COUNT            2   /* N consecutive highs to set */
-#define MA_CLR_COUNT            3   /* M consecutive lows to clear */
-static uint8_t ma_high_run = 0, ma_low_run = 0;
-static bool motion_artifact = false;
-
-static void motion_artifact_update(uint16_t act_rms_x100)
-{
-    if (act_rms_x100 >= MA_HIGH_THRESH_X100) {
-        ma_high_run++; ma_low_run = 0;
-        if (!motion_artifact && ma_high_run >= MA_SET_COUNT) motion_artifact = true;
-    } else {
-        ma_low_run++; ma_high_run = 0;
-        if (motion_artifact && ma_low_run >= MA_CLR_COUNT) motion_artifact = false;
-    }
-}
-
-/* ===== Low battery flag (ADC if VBAT alias provided) ===================== */
-/* Hysteresis to avoid flag flapping while charging.                          */
-#define VBAT_LOW_MV        3000    /* trip threshold */
-#define VBAT_RECOVER_MV    3120    /* clear threshold */
-
-static int32_t vbat_read_mv(void)
-{
-#if HAS_VBAT_ADC
-    if (!device_is_ready(vbat_adc.dev)) {
-        LOG_WRN("VBAT ADC not ready");
-        return -1;
-    }
-
-    /* Configure channel if needed; Zephyr helper handles lazy setup. */
-    int err = adc_channel_setup_dt(&vbat_adc);
-    if (err) {
-        LOG_WRN("adc_channel_setup_dt failed (%d)", err);
-        return -1;
-    }
-
-    int16_t sample = 0;
-    struct adc_sequence seq = {
-        .channels    = BIT(vbat_adc.channel_id),
-        .buffer      = &sample,
-        .buffer_size = sizeof(sample),
-        .resolution  = vbat_adc.resolution,
-        .oversampling = 0,
-        .calibrate = false,
-    };
-
-    err = adc_read(vbat_adc.dev, &seq);
-    if (err) {
-        LOG_WRN("adc_read failed (%d)", err);
-        return -1;
-    }
-
-    /* Convert raw to millivolts at ADC input */
-    int32_t mv = sample;
-    err = adc_raw_to_millivolts_dt(&vbat_adc, &mv);
-    if (err) {
-        LOG_WRN("adc_raw_to_millivolts_dt failed (%d)", err);
-        return -1;
-    }
-
-    /* Scale to true VBAT if a divider is used:
-     * NOTE: Provide your divider ratio via code or DT in the future.
-     * For now assume the input already reflects VBAT (1:1) unless you change it.
-     */
-    return mv; /* if using a divider, multiply here: mv * (Rtop+Rbot)/Rbot */
-#else
-    /* No VBAT channel wired yet: report unavailable. */
-    return -1;
-#endif
-}
-
-static bool low_batt = false;
-static void low_batt_update(void)
-{
-    int32_t mv = vbat_read_mv();
-    if (mv < 0) return; /* not available yet; skip logic cleanly */
-
-    if (mv <= VBAT_LOW_MV)          low_batt = true;
-    else if (mv >= VBAT_RECOVER_MV) low_batt = false;
-}
-
-/* ===== Sensor fault flag (debounced failure counters) ==================== */
-/* Trip when any sensor shows consecutive failures; clear when all recover.   */
-#define SF_ERR_TRIP      3
-#define SF_ERR_CLEAR     3
-static uint8_t err_ppg = 0, ok_ppg = 0;
-static uint8_t err_tmp = 0, ok_tmp = 0;
-static uint8_t err_acc = 0, ok_acc = 0;
-static bool sensor_fault = false;
-
-static void sensor_fault_update(bool ppg_ok, bool tmp_ok, bool acc_ok)
-{
-    if (ppg_ok) { ok_ppg++; err_ppg = 0; } else { err_ppg++; ok_ppg = 0; }
-    if (tmp_ok) { ok_tmp++; err_tmp = 0; } else { err_tmp++; ok_tmp = 0; }
-    if (acc_ok) { ok_acc++; err_acc = 0; } else { err_acc++; ok_acc = 0; }
-
-    bool any_trip = (err_ppg >= SF_ERR_TRIP) || (err_tmp >= SF_ERR_TRIP) || (err_acc >= SF_ERR_TRIP);
-    if (any_trip) sensor_fault = true;
-    else {
-        if (ok_ppg >= SF_ERR_CLEAR && ok_tmp >= SF_ERR_CLEAR && ok_acc >= SF_ERR_CLEAR)
-            sensor_fault = false;
-    }
-}
-
-/* ===== Buzzer pulse (non-blocking) ======================================= */
-#if HAS_BUZZER
 #define BUZZER_ON_MS_EMERG  300
-static struct k_work_delayable buzzer_off_work;
-static void buzzer_off_fn(struct k_work *w) { ARG_UNUSED(w); gpio_pin_set_dt(&buzzer, 0); }
-static void buzzer_pulse_emergency(void)
-{
-    if (!device_is_ready(buzzer.port)) return;
-    gpio_pin_set_dt(&buzzer, 1);
-    k_work_reschedule(&buzzer_off_work, K_MSEC(BUZZER_ON_MS_EMERG));
-}
-#else
-static void buzzer_pulse_emergency(void) { /* no-op */ }
-#endif
 
-/* ===== Charging ⇒ System OFF (simple policy) ============================= */
-/* If STAT (active-low) is LOW: immediately enter System OFF and wake on HIGH. */
-#if HAS_CHG_STAT
-#include <hal/nrf_gpio.h>
-#include <hal/nrf_power.h>
+/* ===== App state ========================================================= */
+enum run_state { RUN_NORMAL = 0, DOCKED_IDLE = 1 };
+static enum run_state pwr_state = RUN_NORMAL;
+static bool low_batt_flag = false;
 
-static inline bool chg_is_active(void)
-{
-    int v = gpio_pin_get_dt(&chg_stat);
-    return (v == 0); /* active-low: 0 => charging */
-}
-
-static void enter_system_off_with_wake_on_unplug(void)
-{
-    LOG_INF("Entering System OFF (charging)");
-    /* For active-low STAT, wake on HIGH (unplug) */
-    if (chg_stat.port == DEVICE_DT_GET(DT_NODELABEL(gpio0))) {
-        nrf_gpio_cfg_sense_set(chg_stat.pin, NRF_GPIO_PIN_SENSE_HIGH);
-    }
-    nrf_power_system_off(NRF_POWER);
-    /* execution halts here until wake; on wake, cold boot resumes at reset */
-}
-
-/* Boot-time check: power off immediately if already charging */
-static void system_off_on_charge_boot_check(void)
-{
-    if (!device_is_ready(chg_stat.port)) {
-        LOG_WRN("CHG_STAT not ready; skipping boot charge check");
-        return;
-    }
-    if (gpio_pin_configure_dt(&chg_stat, GPIO_INPUT) != 0) {
-        LOG_WRN("CHG_STAT config failed");
-        return;
-    }
-    if (chg_is_active()) enter_system_off_with_wake_on_unplug();
-}
-
-/* Runtime detect: if charger plugged while running, power off quickly */
-static struct gpio_callback chg_cb;
-static struct k_work_delayable chg_debounced_off;
-#define CHG_DEBOUNCE_MS 100
-
-static void chg_debounced_off_fn(struct k_work *w)
-{
-    ARG_UNUSED(w);
-    if (chg_is_active()) enter_system_off_with_wake_on_unplug();
-}
-
-static void chg_irq_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    ARG_UNUSED(dev); ARG_UNUSED(cb); ARG_UNUSED(pins);
-    /* Falling edge (HIGH->LOW) indicates "charging" for active-low STAT */
-    k_work_reschedule(&chg_debounced_off, K_MSEC(CHG_DEBOUNCE_MS));
-}
-#endif /* HAS_CHG_STAT */
-
-/* ===== 1 Hz work item (sampling + policy) ================================ */
-static struct k_work_delayable tick_work;
+static struct k_work_delayable tick_work;   /* 1 Hz vitals */
+static struct k_work_delayable pmic_work;   /* 3 s PMIC poll */
 static uint16_t seq;
 
-#define NORMAL_HEARTBEAT_MS  (60 * 1000)
+/* ===== GATT service/CCC ================================================== */
+static void ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+	LOG_INF("Notify %s", notify_enabled ? "ENABLED" : "DISABLED");
+}
+
+/* Attr idx:
+ * [0] Primary Service
+ * [1] Char Declaration
+ * [2] Char VALUE (notify targets this)
+ * [3] CCC
+ */
+BT_GATT_SERVICE_DEFINE(vitalink_svc,
+	BT_GATT_PRIMARY_SERVICE(&svc_uuid),
+	BT_GATT_CHARACTERISTIC(&chr_uuid.uuid,
+		BT_GATT_CHRC_NOTIFY,
+		BT_GATT_PERM_NONE,
+		NULL, NULL, NULL),
+	BT_GATT_CCC(ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
+);
+
+/* ===== Connection callbacks ============================================== */
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+	if (err) {
+		LOG_WRN("Connected failed (err %u)", err);
+		return;
+	}
+	current_conn = bt_conn_ref(conn);
+	LOG_INF("Connected");
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("Disconnected (reason %u)", reason);
+	if (current_conn) {
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+	}
+}
+
+BT_CONN_CB_DEFINE(conn_cb) = {
+	.connected = connected,
+	.disconnected = disconnected,
+};
+
+/* ===== BLE name helper =================================================== */
+#define VITALINK_DYN_NAME_MAX 32
+static void set_dynamic_name_from_addr(void)
+{
+	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+	size_t count = CONFIG_BT_ID_MAX;
+	bt_id_get(addrs, &count);
+
+	if (count == 0) {
+		LOG_WRN("No BLE identities found; keeping default name");
+		return;
+	}
+	const uint8_t *v = addrs[0].a.val; /* 6 bytes, LE */
+	char dyn_name[VITALINK_DYN_NAME_MAX];
+	snprintk(dyn_name, sizeof(dyn_name), "VitalLink-%02X%02X", v[1], v[0]);
+	int err = bt_set_name(dyn_name);
+	if (err) LOG_WRN("bt_set_name failed (%d)", err);
+	else     LOG_INF("BLE name set to: %s", dyn_name);
+}
+
+static int start_advertising(void)
+{
+	static const struct bt_le_adv_param adv = BT_LE_ADV_PARAM_INIT(
+		BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+		BT_GAP_ADV_FAST_INT_MIN_2,
+		BT_GAP_ADV_FAST_INT_MAX_2,
+		NULL
+	);
+	return bt_le_adv_start(&adv, NULL, 0, NULL, 0);
+}
+
+/* ===== Checksum helper (8-bit) ========================================== */
+static uint8_t checksum8(const uint8_t *p, size_t n)
+{
+	uint32_t sum = 0;
+	for (size_t i = 0; i < n; i++) sum += p[i];
+	return (uint8_t)(sum & 0xFF);
+}
+
+/* ===== Tier logic ======================================================== */
+static uint8_t decide_flags(uint8_t hr_bpm, uint8_t spo2, int16_t skin_c_x100)
+{
+	if (hr_bpm >= HR_EMERG_BPM || spo2 <= SPO2_EMERG_PCT || skin_c_x100 >= TEMP_EMERG_C_X100) {
+		return VFLAG_EMERGENCY;
+	}
+	if (hr_bpm >= HR_ALERT_BPM || spo2 <= SPO2_ALERT_PCT || skin_c_x100 >= TEMP_ALERT_C_X100) {
+		return VFLAG_ALERT;
+	}
+	return 0;
+}
+
+static inline uint8_t apply_system_flags(uint8_t base_flags)
+{
+	if (low_batt_flag) base_flags |= VFLAG_LOW_BATT;
+	return base_flags;
+}
+
+static void buzzer_pulse_emergency(void)
+{
+#if HAS_BUZZER
+	if (!device_is_ready(buzzer.port)) return;
+	gpio_pin_set_dt(&buzzer, 1);
+	k_sleep(K_MSEC(BUZZER_ON_MS_EMERG));
+	gpio_pin_set_dt(&buzzer, 0);
+#endif
+}
+
+/* ===== Notify helper ===================================================== */
+static void send_vitals(const struct vitals_pkt *pkt)
+{
+	if (!notify_enabled) return;
+	const struct bt_gatt_attr *attr = &vitalink_svc.attrs[2]; /* value attr */
+	int err = bt_gatt_notify(current_conn, attr, pkt, sizeof(*pkt));
+	if (err && err != -ENOTCONN) {
+		err = bt_gatt_notify(NULL, attr, pkt, sizeof(*pkt));
+	}
+	if (err) LOG_WRN("notify err %d", err);
+}
+
+/* ===== Sampling policy =================================================== */
+#define NORMAL_HEARTBEAT_MS (60 * 1000)
 static uint32_t last_normal_sent_ms = 0;
 
+/* ===== 1 Hz vitals tick ================================================== */
 static void tick_fn(struct k_work *work)
 {
-    ARG_UNUSED(work);
+	ARG_UNUSED(work);
 
-    /* Dummy "OK" status for now; wire these to real read results later. */
-    bool ppg_ok = true, tmp_ok = true, acc_ok = true;
+	/* Keep last-good values to bridge noisy windows */
+	static uint8_t  last_hr_bpm       = 76;
+	static uint8_t  last_spo2         = 98;
+	static int16_t  last_skin_c_x100  = 3650;
+	static uint16_t last_act_rms_x100 = 180;
 
-    /* Dummy vitals */
-    uint8_t  hr_bpm       = 76;
-    uint8_t  spo2         = 98;
-    int16_t  skin_c_x100  = 3650;  /* 36.50 C */
-    uint16_t act_rms_x100 = 180;   /* 1.80 * 0.01 g units */
+	uint8_t  hr_bpm;
+	uint8_t  spo2;
+	int16_t  skin_c_x100;
+	uint16_t act_rms_x100;
 
-    /* ---- Derived flags upkeep ----------------------------------------- */
-    motion_artifact_update(act_rms_x100);
-    low_batt_update();
-    sensor_fault_update(ppg_ok, tmp_ok, acc_ok);
+	/* Single facade call now does everything via raw I2C */
+	int s_ok = sensors_read(&hr_bpm, &spo2, &skin_c_x100, &act_rms_x100);
+	if (s_ok < 0) {
+		hr_bpm       = last_hr_bpm;
+		spo2         = last_spo2;
+		skin_c_x100  = last_skin_c_x100;
+		act_rms_x100 = last_act_rms_x100;
+	} else {
+		last_hr_bpm       = hr_bpm;
+		last_spo2         = spo2;
+		last_skin_c_x100  = skin_c_x100;
+		last_act_rms_x100 = act_rms_x100;
+	}
 
-    /* ---- Tier (alert/emergency) --------------------------------------- */
-    uint8_t flags = decide_flags_tier(hr_bpm, spo2, skin_c_x100);
-    if (motion_artifact) flags |= VFLAG_MOTION_ARTIFACT;
-    if (low_batt)        flags |= VFLAG_LOW_BATT;
-    if (sensor_fault)    flags |= VFLAG_SENSOR_FAULT;
+	if (spo2 > 100) spo2 = 100;
 
-    /* ---- Build packet -------------------------------------------------- */
-    struct vitals_pkt p = {0};
-    p.seq   = seq++;
-    p.ts_ms = k_uptime_get_32();
-    p.flags = flags;
-    p.hr_bpm       = hr_bpm;
-    p.spo2         = spo2;
-    p.skin_c_x100  = skin_c_x100;
-    p.act_rms_x100 = act_rms_x100;
-    vitals_finalize(&p);  /* ver, rfu, checksum */
+	uint8_t flags = decide_flags(hr_bpm, spo2, skin_c_x100);
+	flags = apply_system_flags(flags);
 
-    /* ---- Send policy --------------------------------------------------- */
-    bool should_send = false;
+	struct vitals_pkt p = {0};
+	p.ver   = VITALINK_PROTO_VER;
+	p.seq   = seq++;
+	p.ts_ms = k_uptime_get_32();
+	p.flags = flags;
+	p.hr_bpm       = hr_bpm;
+	p.spo2         = spo2;
+	p.skin_c_x100  = skin_c_x100;
+	p.act_rms_x100 = act_rms_x100;
+	p.checksum     = checksum8((const uint8_t *)&p, 14);
 
-    if ((flags & (VFLAG_ALERT | VFLAG_EMERGENCY)) != 0) {
-        should_send = true;
-        if (flags & VFLAG_EMERGENCY) buzzer_pulse_emergency();
-    } else {
-        uint32_t now = p.ts_ms;
-        if ((now - last_normal_sent_ms) >= NORMAL_HEARTBEAT_MS) {
-            should_send = true;
-            last_normal_sent_ms = now;
-        }
-    }
+	bool should_send = false;
+	if (flags & (VFLAG_ALERT | VFLAG_EMERGENCY)) {
+		should_send = true;
+		if (flags & VFLAG_EMERGENCY) buzzer_pulse_emergency();
+	} else {
+		uint32_t now = p.ts_ms;
+		if ((now - last_normal_sent_ms) >= NORMAL_HEARTBEAT_MS) {
+			should_send = true;
+			last_normal_sent_ms = now;
+		}
+	}
 
-    if (should_send) {
-        /* simple log preview of what we send */
-        LOG_INF("HR=%u BPM, SpO2=%u%%, Temp=%.2fC, flags=0x%02x",
-                p.hr_bpm, p.spo2, p.skin_c_x100 / 100.0f, p.flags);
-        send_vitals(&p);
-    }
+	if (should_send) {
+		send_vitals(&p);
+		LOG_INF("HR=%u BPM, SpO2=%u%% %s%s",
+		        p.hr_bpm, p.spo2,
+		        (flags & VFLAG_LOW_BATT) ? "[LOW_BATT] " : "",
+		        (flags & VFLAG_EMERGENCY) ? "[EMERG]" :
+		        (flags & VFLAG_ALERT) ? "[ALERT]" : "");
+	}
 
-    /* Reschedule for 1 Hz */
-    k_work_reschedule(&tick_work, K_SECONDS(1));
+	k_work_schedule(&tick_work, K_SECONDS(1));
+}
+
+/* ===== PMIC polling: low-batt + docked-idle ============================== */
+static void enter_docked_idle(void)
+{
+	if (pwr_state == DOCKED_IDLE) return;
+	bt_le_adv_stop();
+	k_work_cancel_delayable(&tick_work);
+	pwr_state = DOCKED_IDLE;
+	LOG_INF("Docked: charging → pause BLE/sampling");
+}
+
+static void exit_docked_idle(void)
+{
+	if (pwr_state == RUN_NORMAL) return;
+	int err = start_advertising();
+	if (err) LOG_WRN("adv restart err %d", err);
+	k_work_schedule(&tick_work, K_SECONDS(1));
+	pwr_state = RUN_NORMAL;
+	LOG_INF("Undocked: resume BLE/sampling");
+}
+
+static void pmic_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	bool usb_ok=false, charging=false;
+	uint16_t vbat_mv=0;
+
+	int s1 = bq25155_read_status(i2c0_dev, &usb_ok, &charging);
+	int s2 = bq25155_read_vbat_mv(i2c0_dev, &vbat_mv);
+
+	if (s2 == 0) {
+		if (!low_batt_flag && vbat_mv <= LOW_BATT_ALERT_MV) {
+			low_batt_flag = true;
+			LOG_WRN("Low battery: %u mV", vbat_mv);
+		} else if (low_batt_flag && vbat_mv >= LOW_BATT_RECOVER_MV) {
+			low_batt_flag = false;
+			LOG_INF("Battery recovered: %u mV", vbat_mv);
+		}
+	}
+
+	if (s1 == 0) {
+		if (charging && pwr_state == RUN_NORMAL) {
+			enter_docked_idle();
+		} else if (!charging && pwr_state == DOCKED_IDLE) {
+			exit_docked_idle();
+		}
+	}
+
+	k_work_schedule(&pmic_work, K_SECONDS(3));
+}
+
+/* ===== BLE ready callback ================================================ */
+static void bt_ready_cb(int err)
+{
+	if (err) {
+		LOG_ERR("Bluetooth init failed (%d)", err);
+		return;
+	}
+	err = start_advertising();
+	if (err) LOG_ERR("Advertising start failed (%d)", err);
+	else     LOG_INF("Advertising started");
 }
 
 /* ===== App entry ========================================================= */
 void main(void)
 {
-    /* I2C device handle (for later sensor work) */
-    i2c_dev = DEVICE_DT_GET(I2C_NODE);
-    if (!device_is_ready(i2c_dev)) {
-        LOG_WRN("I2C device not ready (OK for now)");
-    }
+	/* I2C dev */
+	i2c0_dev = DEVICE_DT_GET(I2C_NODE);
 
+	if (!device_is_ready(i2c0_dev)) {
+		LOG_ERR("I2C not ready");
+	} else {
+		/* PMIC init */
+		(void)bq25155_init(i2c0_dev);
+
+		/* Initialize sensor facade (raw I2C paths) */
+		int sret = sensors_init(i2c0_dev);
+		if (sret) {
+			LOG_WRN("sensors_init returned %d (falling back to last-good if needed)", sret);
+		}
+
+		/* If already charging at boot, enter DOCKED_IDLE right away */
+		bool usb_ok = false, charging = false;
+		if (bq25155_read_status(i2c0_dev, &usb_ok, &charging) == 0) {
+			if (charging && pwr_state == RUN_NORMAL) {
+				enter_docked_idle();  /* stops adv + sampling */
+			}
+		}
+	}
+
+	/* Buzzer */
 #if HAS_BUZZER
-    if (device_is_ready(buzzer.port)) {
-        int err = gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
-        if (err) LOG_WRN("Buzzer gpio config failed (%d)", err);
-        k_work_init_delayable(&buzzer_off_work, buzzer_off_fn);
-    } else {
-        LOG_WRN("Buzzer GPIO not ready");
-    }
+	if (device_is_ready(buzzer.port)) {
+		int e = gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
+		if (e) { LOG_WRN("buzzer gpio cfg err %d", e); }
+	}
 #endif
 
-#if HAS_CHG_STAT
-    /* Boot-time "charging ⇒ System OFF" check BEFORE starting BLE, etc. */
-    system_off_on_charge_boot_check();
+	/* INT inputs + charge enable default (enable charger: CE_N low) */
+	if (device_is_ready(pin_temp_int.port)) {
+		int e = gpio_pin_configure_dt(&pin_temp_int, GPIO_INPUT);
+		if (e) { LOG_WRN("temp_int cfg err %d", e); }
+	}
+	if (device_is_ready(pin_hr_int.port)) {
+		int e = gpio_pin_configure_dt(&pin_hr_int, GPIO_INPUT);
+		if (e) { LOG_WRN("hr_int cfg err %d", e); }
+	}
+	if (device_is_ready(pin_imu_int.port)) {
+		int e = gpio_pin_configure_dt(&pin_imu_int, GPIO_INPUT);
+		if (e) { LOG_WRN("imu_int cfg err %d", e); }
+	}
+	if (device_is_ready(pin_chg_en.port)) {
+		int e = gpio_pin_configure_dt(&pin_chg_en, GPIO_OUTPUT_ACTIVE);
+		if (e) { LOG_WRN("chg_en cfg err %d", e); }
+	}
 
-    /* Runtime detect: configure interrupt so plugging-in powers off quickly */
-    if (device_is_ready(chg_stat.port)) {
-        gpio_init_callback(&chg_cb, chg_irq_handler, BIT(chg_stat.pin));
-        gpio_add_callback(chg_stat.port, &chg_cb);
-        /* Falling edge (HIGH->LOW) for active-low STAT = start charging */
-        gpio_pin_interrupt_configure_dt(&chg_stat, GPIO_INT_EDGE_FALLING);
-        k_work_init_delayable(&chg_debounced_off, chg_debounced_off_fn);
-    } else {
-        LOG_WRN("CHG_STAT GPIO not ready for runtime detect");
-    }
-#endif
+	/* Dynamic name before advertising */
+	set_dynamic_name_from_addr();
 
-    /* Dynamic BLE name BEFORE advertising */
-    set_dynamic_name_from_addr();
+	/* Start BLE unless we already entered DOCKED_IDLE above */
+	int err = bt_enable(bt_ready_cb);
+	if (err) {
+		LOG_ERR("bt_enable failed: %d", err);
+		return;
+	}
+	if (pwr_state == DOCKED_IDLE) {
+		bt_le_adv_stop();
+		LOG_INF("Booted in docked state: BLE/sampling paused");
+	}
 
-    /* Start Bluetooth stack; advertising begins in callback on success */
-    int err = bt_enable(bt_ready_cb);
-    if (err) {
-        LOG_ERR("bt_enable failed: %d", err);
-        return;
-    }
+	/* start 1 Hz sampler/publisher (only in RUN_NORMAL) */
+	k_work_init_delayable(&tick_work, tick_fn);
+	if (pwr_state == RUN_NORMAL) {
+		k_work_schedule(&tick_work, K_SECONDS(1));
+	}
 
-    /* Start 1 Hz sampler/publisher */
-    k_work_init_delayable(&tick_work, tick_fn);
-    k_work_schedule(&tick_work, K_SECONDS(1));
+	/* start PMIC polling (low-batt + docked-idle) */
+	k_work_init_delayable(&pmic_work, pmic_fn);
+	k_work_schedule(&pmic_work, K_SECONDS(3));
 }
