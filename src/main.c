@@ -76,6 +76,10 @@ static struct bt_conn *current_conn;
 
 #define BUZZER_ON_MS_EMERG  300
 
+/* "extreme motion" (possible fall)          */
+/* act_rms_x100 is RMS acceleration in g * 100 (≈200 at 2 g full-scale).    */
+#define FALL_ACCEL_THRESHOLD_X100  180   /* ~1.8 g – tweak based on testing */
+
 /* ===== App state ========================================================= */
 enum run_state { RUN_NORMAL = 0, DOCKED_IDLE = 1 };
 static enum run_state pwr_state = RUN_NORMAL;
@@ -246,10 +250,21 @@ static void tick_fn(struct k_work *work)
 		last_act_rms_x100 = act_rms_x100;
 	}
 
-	if (spo2 > 100) spo2 = 100;
+    if (spo2 > 100) spo2 = 100;
 
-	uint8_t flags = decide_flags(hr_bpm, spo2, skin_c_x100);
-	flags = apply_system_flags(flags);
+    /* Base tier decision from HR / SpO2 / Temp */
+    uint8_t flags = decide_flags(hr_bpm, spo2, skin_c_x100);
+
+    /* Extreme motion (possible fall): treat as EMERGENCY as well */
+    bool fall_like_motion = (act_rms_x100 >= FALL_ACCEL_THRESHOLD_X100);
+    if (fall_like_motion) {
+        flags |= VFLAG_EMERGENCY;
+		LOG_WRN("Extreme motion detected (act_rms_x100=%u) -> EMERGENCY", act_rms_x100);
+    }
+	
+
+    /* Add system-level flags (low battery, etc.) */
+    flags = apply_system_flags(flags);
 
 	struct vitals_pkt p = {0};
 	p.ver   = VITALINK_PROTO_VER;

@@ -123,6 +123,10 @@
 		hr-int   = &hr_int;
 		imu-int  = &imu_int;
 	};
+
+	ipc {
+		status = "okay";
+	};
 };
 
 &cryptocell {
@@ -131,4 +135,11 @@
 
 &uart0 {
     status = "disabled";
+};
+&mutex {
+	status = "okay";
+};
+
+&mbox {
+	status = "okay";
 };
