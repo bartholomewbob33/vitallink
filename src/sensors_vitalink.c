@@ -139,6 +139,10 @@ static uint8_t g_spo2   = 98;
 static bool    g_hr_ok  = false;
 static bool    g_s2_ok  = false;
 
+/* NEW: scratch buffers for analysis (avoid large stack usage) */
+static uint32_t ppg_ir_win[PPG_WIN_LEN];
+static uint32_t ppg_red_win[PPG_WIN_LEN];
+
 static struct k_work_delayable ppg_work;
 
 static inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
@@ -328,18 +332,19 @@ static void ppg_work_fn(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    uint32_t ir=0, red=0;
+    uint32_t ir = 0, red = 0;
     if (max30102_read_sample(&ir, &red) == 0) {
         ir  = clamp_u32(ir,  0, 0x03FFFF);
         red = clamp_u32(red, 0, 0x03FFFF);
         ring_push(ir, red);
 
-        /* Try compute on-the-fly every tick (cheap) */
-        uint32_t ir_w[PPG_WIN_LEN], red_w[PPG_WIN_LEN];
-        int n = copy_window(ir_w, red_w);
+        /* Use static window buffers instead of big stack arrays */
+        int n = copy_window(ppg_ir_win, ppg_red_win);
         if (n > 0) {
-            uint8_t hr=0, s2=0; bool hr_ok=false, s2_ok=false;
-            if (analyze_ppg(ir_w, red_w, n, &hr, &hr_ok, &s2, &s2_ok) == 0) {
+            uint8_t hr = 0, s2 = 0;
+            bool hr_ok = false, s2_ok = false;
+            if (analyze_ppg(ppg_ir_win, ppg_red_win, n,
+                            &hr, &hr_ok, &s2, &s2_ok) == 0) {
                 if (hr_ok) { g_hr_bpm = hr; g_hr_ok = true; }
                 if (s2_ok) { g_spo2   = s2; g_s2_ok = true; }
             }
