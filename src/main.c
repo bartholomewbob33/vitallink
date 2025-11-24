@@ -16,12 +16,14 @@
  * --------------------------------------------------------------------------- */
 
 #include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
 #include <zephyr/logging/log.h>
 #include <stdbool.h>
 #include <string.h>
@@ -38,7 +40,7 @@ LOG_MODULE_REGISTER(vitalink, LOG_LEVEL_INF);
 #define I2C_NODE DT_ALIAS(i2c_ppg)
 static const struct device *i2c0_dev;
 
-/* ===== Optional buzzer (active-high) ===================================== */
+/* ===== Optional buzzer (active-high in devicetree) ======================= */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(buzzer), okay)
 #define HAS_BUZZER 1
 static const struct gpio_dt_spec buzzer = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios);
@@ -78,7 +80,7 @@ static struct bt_conn *current_conn;
 
 /* "extreme motion" (possible fall)          */
 /* act_rms_x100 is RMS acceleration in g * 100 (≈200 at 2 g full-scale).    */
-#define FALL_ACCEL_THRESHOLD_X100  180   /* ~1.8 g – tweak based on testing */
+#define FALL_ACCEL_THRESHOLD_X100  300   /* ~1.8 g – tweak based on testing */
 
 /* ===== App state ========================================================= */
 enum run_state { RUN_NORMAL = 0, DOCKED_IDLE = 1 };
@@ -137,25 +139,36 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.disconnected = disconnected,
 };
 
-/* ===== BLE name helper =================================================== */
+/* ===== BLE name + address helper ========================================= */
 #define VITALINK_DYN_NAME_MAX 32
+
 static void set_dynamic_name_from_addr(void)
 {
-	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
-	size_t count = CONFIG_BT_ID_MAX;
-	bt_id_get(addrs, &count);
+    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+    size_t count = CONFIG_BT_ID_MAX;
 
-	if (count == 0) {
-		LOG_WRN("No BLE identities found; keeping default name");
-		return;
-	}
-	const uint8_t *v = addrs[0].a.val; /* 6 bytes, LE */
-	char dyn_name[VITALINK_DYN_NAME_MAX];
-	snprintk(dyn_name, sizeof(dyn_name), "VitalLink-%02X%02X", v[1], v[0]);
-	int err = bt_set_name(dyn_name);
-	if (err) LOG_WRN("bt_set_name failed (%d)", err);
-	else     LOG_INF("BLE name set to: %s", dyn_name);
+    /* bt_id_get() fills addrs[0..count-1] and updates count */
+    bt_id_get(addrs, &count);
+
+    if (count == 0) {
+        LOG_WRN("No BLE identities found; keeping default name");
+        return;
+    }
+
+    const uint8_t *v = addrs[0].a.val; /* 6 bytes, LE order */
+
+    char dyn_name[VITALINK_DYN_NAME_MAX];
+    snprintk(dyn_name, sizeof(dyn_name), "VitalLink-%02X%02X", v[1], v[0]);
+
+    int err = bt_set_name(dyn_name);
+    if (err) {
+        LOG_WRN("bt_set_name failed (%d)", err);
+    } else {
+        LOG_INF("BLE name set to: %s", dyn_name);
+    }
 }
+
+
 
 static int start_advertising(void)
 {
@@ -197,24 +210,74 @@ static inline uint8_t apply_system_flags(uint8_t base_flags)
 static void buzzer_pulse_emergency(void)
 {
 #if HAS_BUZZER
-	if (!device_is_ready(buzzer.port)) return;
+	if (!device_is_ready(buzzer.port)) {
+		LOG_WRN("buzzer port not ready in pulse");
+		return;
+	}
+
+	/* NOTE: assumes buzzer is active-high in devicetree; change if PCB is active-low */
+	LOG_INF("Emergency buzzer pulse");
 	gpio_pin_set_dt(&buzzer, 1);
 	k_sleep(K_MSEC(BUZZER_ON_MS_EMERG));
 	gpio_pin_set_dt(&buzzer, 0);
 #endif
 }
 
+/* ===== Packet debug logging ============================================= */
+static void log_vitals_debug(const struct vitals_pkt *p, bool will_tx)
+{
+    /* Pretty-print temperature from x100 format */
+    int16_t t = p->skin_c_x100;
+    int16_t t_whole = t / 100;
+    int16_t t_frac  = t >= 0 ? (t % 100) : -(t % 100);
+
+    LOG_INF("VITALS %s: ver=%u seq=%u ts_ms=%u flags=0x%02x "
+            "HR=%u BPM SpO2=%u%% Temp=%d.%02d C act_rms_x100=%u checksum=0x%02X",
+            will_tx ? "[TX]" : "[NO-TX]",
+            p->ver,
+            p->seq,
+            p->ts_ms,
+            p->flags,
+            p->hr_bpm,
+            p->spo2,
+            t_whole,
+            t_frac,
+            p->act_rms_x100,
+            p->checksum);
+
+}
+
 /* ===== Notify helper ===================================================== */
 static void send_vitals(const struct vitals_pkt *pkt)
 {
-	if (!notify_enabled) return;
-	const struct bt_gatt_attr *attr = &vitalink_svc.attrs[2]; /* value attr */
-	int err = bt_gatt_notify(current_conn, attr, pkt, sizeof(*pkt));
-	if (err && err != -ENOTCONN) {
-		err = bt_gatt_notify(NULL, attr, pkt, sizeof(*pkt));
-	}
-	if (err) LOG_WRN("notify err %d", err);
+    if (!notify_enabled) {
+        LOG_DBG("Notification skipped: CCCD disabled");
+        return;
+    }
+
+    const struct bt_gatt_attr *attr = &vitalink_svc.attrs[2]; /* value attr */
+    int err = bt_gatt_notify(current_conn, attr, pkt, sizeof(*pkt));
+    if (err == -ENOTCONN) {
+        /* Try all connections if current_conn is gone */
+        err = bt_gatt_notify(NULL, attr, pkt, sizeof(*pkt));
+    }
+
+    if (err) {
+        LOG_WRN("notify err %d", err);
+    } else {
+        int16_t t_whole = pkt->skin_c_x100 / 100;
+        int16_t t_frac  = pkt->skin_c_x100 >= 0 ?
+                          (pkt->skin_c_x100 % 100) : -(pkt->skin_c_x100 % 100);
+
+        LOG_INF("notify OK (seq=%u, flags=0x%02x, HR=%u, SpO2=%u, "
+                "Temp=%d.%02d C, act_rms_x100=%u)",
+                pkt->seq, pkt->flags,
+                pkt->hr_bpm, pkt->spo2,
+                t_whole, t_frac,
+                pkt->act_rms_x100);
+    }
 }
+
 
 /* ===== Sampling policy =================================================== */
 #define NORMAL_HEARTBEAT_MS (60 * 1000)
@@ -223,27 +286,33 @@ static uint32_t last_normal_sent_ms = 0;
 /* ===== 1 Hz vitals tick ================================================== */
 static void tick_fn(struct k_work *work)
 {
-	ARG_UNUSED(work);
+    ARG_UNUSED(work);
 
-	/* Keep last-good values to bridge noisy windows */
-	static uint8_t  last_hr_bpm       = 76;
-	static uint8_t  last_spo2         = 98;
-	static int16_t  last_skin_c_x100  = 3650;
-	static uint16_t last_act_rms_x100 = 180;
+    /* Keep last-good values to bridge noisy windows */
+    static uint8_t  last_hr_bpm       = 0;
+    static uint8_t  last_spo2         = 0;
+    static int16_t  last_skin_c_x100  = 0;
+    static uint16_t last_act_rms_x100 = 0;
 
-	uint8_t  hr_bpm;
-	uint8_t  spo2;
-	int16_t  skin_c_x100;
-	uint16_t act_rms_x100;
+    uint8_t  hr_bpm;
+    uint8_t  spo2;
+    int16_t  skin_c_x100;
+    uint16_t act_rms_x100;
 
-	/* Single facade call now does everything via raw I2C */
-	int s_ok = sensors_read(&hr_bpm, &spo2, &skin_c_x100, &act_rms_x100);
+    /* Single facade call now does everything via raw I2C */
+    int s_ok = sensors_read(&hr_bpm, &spo2, &skin_c_x100, &act_rms_x100);
 	if (s_ok < 0) {
+		LOG_WRN("sensors_read failed (%d); using last values HR=%u, SpO2=%u, Temp=%d, act_rms_x100=%u",
+				s_ok, last_hr_bpm, last_spo2, last_skin_c_x100, last_act_rms_x100);
+
 		hr_bpm       = last_hr_bpm;
 		spo2         = last_spo2;
 		skin_c_x100  = last_skin_c_x100;
 		act_rms_x100 = last_act_rms_x100;
 	} else {
+		LOG_INF("sensors_read OK: HR=%u, SpO2=%u, Temp_x100=%d, act_rms_x100=%u",
+				hr_bpm, spo2, skin_c_x100, act_rms_x100);
+
 		last_hr_bpm       = hr_bpm;
 		last_spo2         = spo2;
 		last_skin_c_x100  = skin_c_x100;
@@ -259,47 +328,65 @@ static void tick_fn(struct k_work *work)
     bool fall_like_motion = (act_rms_x100 >= FALL_ACCEL_THRESHOLD_X100);
     if (fall_like_motion) {
         flags |= VFLAG_EMERGENCY;
-		LOG_WRN("Extreme motion detected (act_rms_x100=%u) -> EMERGENCY", act_rms_x100);
+        LOG_WRN("Extreme motion detected (act_rms_x100=%u) -> EMERGENCY", act_rms_x100);
     }
-	
 
     /* Add system-level flags (low battery, etc.) */
     flags = apply_system_flags(flags);
 
-	struct vitals_pkt p = {0};
-	p.ver   = VITALINK_PROTO_VER;
-	p.seq   = seq++;
-	p.ts_ms = k_uptime_get_32();
-	p.flags = flags;
-	p.hr_bpm       = hr_bpm;
-	p.spo2         = spo2;
-	p.skin_c_x100  = skin_c_x100;
-	p.act_rms_x100 = act_rms_x100;
-	p.checksum     = checksum8((const uint8_t *)&p, 14);
+    struct vitals_pkt p = {0};
+    p.ver   = VITALINK_PROTO_VER;
+    p.seq   = seq++;
+    p.ts_ms = k_uptime_get_32();
+    p.flags = flags;
+    p.hr_bpm       = hr_bpm;
+    p.spo2         = spo2;
+    p.skin_c_x100  = skin_c_x100;
+    p.act_rms_x100 = act_rms_x100;
+    p.checksum     = checksum8((const uint8_t *)&p, 14);
 
-	bool should_send = false;
-	if (flags & (VFLAG_ALERT | VFLAG_EMERGENCY)) {
-		should_send = true;
-		if (flags & VFLAG_EMERGENCY) buzzer_pulse_emergency();
-	} else {
-		uint32_t now = p.ts_ms;
-		if ((now - last_normal_sent_ms) >= NORMAL_HEARTBEAT_MS) {
-			should_send = true;
-			last_normal_sent_ms = now;
-		}
-	}
+    bool should_send = false;
+    if (flags & (VFLAG_ALERT | VFLAG_EMERGENCY)) {
+        /* ALERT / EMERGENCY: always push immediately */
+        should_send = true;
+        if (flags & VFLAG_EMERGENCY) {
+            buzzer_pulse_emergency();
+        }
+    } else {
+        /* NORMAL: rate-limit BLE to 1 packet per minute */
+        uint32_t now = p.ts_ms;
+        if ((now - last_normal_sent_ms) >= NORMAL_HEARTBEAT_MS) {
+            should_send = true;
+            last_normal_sent_ms = now;
+        }
+    }
 
-	if (should_send) {
-		send_vitals(&p);
-		LOG_INF("HR=%u BPM, SpO2=%u%% %s%s",
-		        p.hr_bpm, p.spo2,
-		        (flags & VFLAG_LOW_BATT) ? "[LOW_BATT] " : "",
-		        (flags & VFLAG_EMERGENCY) ? "[EMERG]" :
-		        (flags & VFLAG_ALERT) ? "[ALERT]" : "");
-	}
+    /* NEW: log full packet + fields EVERY SECOND, even if we don't send */
+    log_vitals_debug(&p, should_send);
 
-	k_work_schedule(&tick_work, K_SECONDS(1));
+    /* Only actually notify over BLE when warranted */
+    if (should_send) {
+        send_vitals(&p);
+    }
+
+    /* Keep a compact "human" log each second too, if you like: */
+    int16_t t_whole = p.skin_c_x100 / 100;
+    int16_t t_frac  = p.skin_c_x100 >= 0 ?
+                      (p.skin_c_x100 % 100) : -(p.skin_c_x100 % 100);
+
+    LOG_INF("HR=%u BPM, SpO2=%u%%, Temp=%d.%02d C, act_rms_x100=%u %s%s",
+            p.hr_bpm,
+            p.spo2,
+            t_whole, t_frac,
+            p.act_rms_x100,
+            (flags & VFLAG_LOW_BATT) ? "[LOW_BATT] " : "",
+            (flags & VFLAG_EMERGENCY) ? "[EMERG]" :
+            (flags & VFLAG_ALERT) ? "[ALERT]" : "");
+
+    /* Re-arm the 1 Hz tick */
+    k_work_schedule(&tick_work, K_SECONDS(1));
 }
+
 
 /* ===== PMIC polling: low-batt + docked-idle ============================== */
 static void enter_docked_idle(void)
@@ -354,20 +441,61 @@ static void pmic_fn(struct k_work *work)
 /* ===== BLE ready callback ================================================ */
 static void bt_ready_cb(int err)
 {
-	if (err) {
-		LOG_ERR("Bluetooth init failed (%d)", err);
-		return;
+    if (err) {
+        LOG_ERR("Bluetooth init failed (%d)", err);
+        return;
+    }
+
+    LOG_INF("bt_ready_cb: controller up");
+
+    /* Load persisted settings (includes BT identity, IRK, etc.) */
+    if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+        int s_err = settings_load();
+        if (s_err) {
+            LOG_WRN("settings_load failed (%d)", s_err);
+        } else {
+            LOG_INF("settings_load done");
+        }
+    }
+
+    /* Now we should have at least one identity → set dynamic name */
+    set_dynamic_name_from_addr();
+
+	const char *name = bt_get_name();
+	if (name && name[0] != '\0') {
+		LOG_INF("BLE local name: %s", name);
+	} else {
+		LOG_INF("BLE local name is empty or unavailable");
 	}
-	err = start_advertising();
-	if (err) LOG_ERR("Advertising start failed (%d)", err);
-	else     LOG_INF("Advertising started");
+
+    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+    size_t count = CONFIG_BT_ID_MAX;
+    bt_id_get(addrs, &count);
+    if (count > 0) {
+        char addr_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(&addrs[0], addr_str, sizeof(addr_str));
+        LOG_INF("BLE identity[0]: %s", addr_str);
+    } else {
+        LOG_WRN("Still no BLE identities after settings_load");
+    }
+
+    /* Finally start advertising */
+    int adv_err = start_advertising();
+    if (adv_err) {
+        LOG_ERR("Advertising start failed (%d)", adv_err);
+    } else {
+        LOG_INF("Advertising started");
+    }
 }
+
+
 
 /* ===== App entry ========================================================= */
 void main(void)
 {
 	/* I2C dev */
 	i2c0_dev = DEVICE_DT_GET(I2C_NODE);
+	LOG_INF("HELLO");
 
 	if (!device_is_ready(i2c0_dev)) {
 		LOG_ERR("I2C not ready");
@@ -385,16 +513,29 @@ void main(void)
 		bool usb_ok = false, charging = false;
 		if (bq25155_read_status(i2c0_dev, &usb_ok, &charging) == 0) {
 			if (charging && pwr_state == RUN_NORMAL) {
-				enter_docked_idle();  /* stops adv + sampling */
+				enter_docked_idle();  /* stops adv + sampling (once BLE is up) */
 			}
 		}
 	}
 
-	/* Buzzer */
+	/* Buzzer smoke test at boot */
 #if HAS_BUZZER
-	if (device_is_ready(buzzer.port)) {
+	if (!device_is_ready(buzzer.port)) {
+		LOG_ERR("buzzer port not ready");
+	} else {
+		LOG_INF("Configuring buzzer pin %d", buzzer.pin);
 		int e = gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
-		if (e) { LOG_WRN("buzzer gpio cfg err %d", e); }
+		if (e) {
+			LOG_ERR("buzzer gpio cfg err %d", e);
+		} else {
+			LOG_INF("Buzzer ON (boot test)");
+			int e1 = gpio_pin_set_dt(&buzzer, 1);
+			if (e1) LOG_ERR("buzzer set(1) err %d", e1);
+			k_sleep(K_MSEC(BUZZER_ON_MS_EMERG));
+			LOG_INF("Buzzer OFF (boot test)");
+			int e2 = gpio_pin_set_dt(&buzzer, 0);
+			if (e2) LOG_ERR("buzzer set(0) err %d", e2);
+		}
 	}
 #endif
 
@@ -416,16 +557,15 @@ void main(void)
 		if (e) { LOG_WRN("chg_en cfg err %d", e); }
 	}
 
-	/* Dynamic name before advertising */
-	set_dynamic_name_from_addr();
-
-	/* Start BLE unless we already entered DOCKED_IDLE above */
+	/* Start BLE */
 	int err = bt_enable(bt_ready_cb);
 	if (err) {
 		LOG_ERR("bt_enable failed: %d", err);
 		return;
 	}
+
 	if (pwr_state == DOCKED_IDLE) {
+		/* If we decided we were docked at boot, make sure BLE is paused */
 		bt_le_adv_stop();
 		LOG_INF("Booted in docked state: BLE/sampling paused");
 	}

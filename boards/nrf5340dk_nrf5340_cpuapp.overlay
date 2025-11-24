@@ -143,3 +143,7 @@
 &mbox {
 	status = "okay";
 };
+
+&arduino_adc {
+	io-channel-map = <0 &adc 0>, <1 &adc 1>, <2 &adc 2>, <3 &adc 3>, <4 &adc 4>, <5 &adc 5>;
+};

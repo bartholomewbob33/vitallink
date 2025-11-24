@@ -387,8 +387,8 @@ int sensors_read(uint8_t *hr_bpm,
                  uint16_t *act_rms_x100)
 {
     int rc = 0;
-    static uint8_t  last_hr  = 76;
-    static uint8_t  last_s2  = 98;
+    static uint8_t  last_hr  = 0;
+    static uint8_t  last_s2  = 0;
 
     /* Skin temp */
     if (skin_c_x100) {
