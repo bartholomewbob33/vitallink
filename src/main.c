@@ -170,16 +170,46 @@ static void set_dynamic_name_from_addr(void)
 
 
 
+#define VITALLINK_NAME "VitalLink-5CB3"
+
+/* explicit AD payload bytes so the compiler is happy */
+static const uint8_t adv_flags[] = {
+    BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR,
+};
+
+static const uint8_t adv_name[] = VITALLINK_NAME;
+
 static int start_advertising(void)
 {
-	static const struct bt_le_adv_param adv = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
-		BT_GAP_ADV_FAST_INT_MIN_2,
-		BT_GAP_ADV_FAST_INT_MAX_2,
-		NULL
-	);
-	return bt_le_adv_start(&adv, NULL, 0, NULL, 0);
+    /* explicit advertising data: Flags + Complete Local Name */
+    static const struct bt_data ad[] = {
+        BT_DATA(BT_DATA_FLAGS, adv_flags, sizeof(adv_flags)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, adv_name, sizeof(adv_name) - 1),
+    };
+
+    /* connectable legacy advertising params */
+    static const struct bt_le_adv_param adv = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONNECTABLE,      /* no USE_NAME here, we put name in AD */
+        BT_GAP_ADV_FAST_INT_MIN_2,
+        BT_GAP_ADV_FAST_INT_MAX_2,
+        NULL
+    );
+
+    return bt_le_adv_start(&adv, ad, ARRAY_SIZE(ad), NULL, 0);
 }
+
+
+
+// static int start_advertising(void)
+// {
+// 	static const struct bt_le_adv_param adv = BT_LE_ADV_PARAM_INIT(
+// 		BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+// 		BT_GAP_ADV_FAST_INT_MIN_2,
+// 		BT_GAP_ADV_FAST_INT_MAX_2,
+// 		NULL
+// 	);
+// 	return bt_le_adv_start(&adv, NULL, 0, NULL, 0);
+// }
 
 /* ===== Checksum helper (8-bit) ========================================== */
 static uint8_t checksum8(const uint8_t *p, size_t n)
@@ -495,7 +525,7 @@ void main(void)
 {
 	/* I2C dev */
 	i2c0_dev = DEVICE_DT_GET(I2C_NODE);
-	LOG_INF("HELLO");
+	LOG_INF("HELLO123");
 
 	if (!device_is_ready(i2c0_dev)) {
 		LOG_ERR("I2C not ready");
